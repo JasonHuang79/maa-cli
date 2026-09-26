@@ -1,0 +1,566 @@
+name: Build Android
+
+# 交叉编译 maa-cli 到 Android（Termux 本机运行），并与官方 MaaCore 组件包打包在一起。
+#
+# === 为什么单独一个 workflow ===
+# 上游 release.yml 是发版流程（会打 tag、改 version 分支、发布 Release），把 Android
+# 塞进去会让 fork 每次同步 upstream 时冲突。这里做成独立 workflow，只在 fork 上运行。
+#
+# === 产物结构 ===
+#   maa_cli-v<version>-aarch64-linux-android.tar.gz
+#   maa_cli-v<version>-x86_64-linux-android.tar.gz
+# 每个包内（与 maa-cli 在其他平台的包一致，但多带 MaaCore）：
+#   maa                                  ← maa-cli 可执行文件
+#   lib/libMaaCore.so 等                 ← 来自官方 MAAComponent-android-*.tar.gz
+#
+# === 关键事实（来自实测与源码确认）===
+# 1. MaaCore 不在本仓库。而上游 MaaAssistantArknights 已发布 Android 组件包
+#    MAAComponent-v<version>-android-{arm64,x64}.tar.gz，且其 ci.yml 有 android job
+#    （提交 c6f930a60d "feat: support native android (#16179)"）。直接复用它，
+#    无需在本仓库重新编译 MaaCore（省掉约 40 分钟构建）。
+# 2. git2 → openssl 在 Android 上编不过：MaaDeps 不含 openssl，而 vendored
+#    编译需要 Perl（CI 上没装会失败）。故用 --no-default-features --features
+#    core_installer（保留 MaaCore 安装/更新能力，去掉 git2 资源后端）。
+# 3. maa-cli 用 consts::DLL_SUFFIX 推断库文件名，Android 上自动得到 libMaaCore.so，
+#    无需改 Rust 代码。
+# 4. 打包格式沿用上游 xtask 的命名规则（maa_cli-v{version}-{target}.tar.gz），
+#    其中 aarch64/x86_64-linux-android 含 "-linux-"，会被识别为 TarGz。
+
+on:
+  workflow_dispatch:
+    inputs:
+      maa_version:
+        description: MAACore/MAAComponent 版本（如 v6.18.0），留空则取最新正式版
+        required: false
+        default: ""
+      maa_cli_version:
+        description: 覆盖 maa-cli 版本号（写入二进制与包名），留空则用 Cargo.toml 的版本
+        required: false
+        default: ""
+  schedule:
+    # 每周一 04:00 UTC 构建一次，避免产物过期
+    - cron: "0 4 * * 1"
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  # 取得要用的版本号（MAAComponent 版本 + maa-cli 版本）
+  meta:
+    name: Meta
+    runs-on: ubuntu-latest
+    outputs:
+      maa_version: ${{ steps.resolve.outputs.maa_version }}
+      cli_version: ${{ steps.resolve.outputs.cli_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve versions
+        id: resolve
+        env:
+          INPUT_MAA: ${{ inputs.maa_version }}
+          INPUT_CLI: ${{ inputs.maa_cli_version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # MAAComponent 版本：优先用输入，否则取上游最新正式版
+          maa_version="$INPUT_MAA"
+          if [ -z "$maa_version" ]; then
+            maa_version="$(gh api \
+              repos/MaaAssistantArknights/MaaAssistantArknights/releases/latest \
+              --jq .tag_name)"
+            echo "未指定 MAA 版本，取最新正式版：$maa_version"
+          fi
+          case "$maa_version" in
+            v*) ;;
+            *) maa_version="v$maa_version" ;;
+          esac
+
+          # 确认该版本确实有 Android 组件包，避免把不存在的版本带进后续步骤
+          available="$(gh api \
+            "repos/MaaAssistantArknights/MaaAssistantArknights/releases/tags/$maa_version" \
+            --jq '.assets[].name' | grep -c 'android' || true)"
+          if [ "$available" -eq 0 ]; then
+            echo "::error::$maa_version 没有 Android 组件包（MAAComponent-*-android-*.tar.gz）"
+            echo "该版本可能早于 native android 支持（见 MAA PR #16179），请换一个版本。"
+            exit 1
+          fi
+          echo "确认 $maa_version 有 $available 个 android 资产"
+
+          # maa-cli 版本：优先用输入，否则读 Cargo.toml
+          cli_version="$INPUT_CLI"
+          if [ -z "$cli_version" ]; then
+            cli_version="$(grep -m1 '^version' crates/maa-cli/Cargo.toml \
+              | sed -E 's/.*"(.*)".*/\1/')"
+          fi
+          cli_version="${cli_version#v}"
+
+          echo "maa_version=$maa_version" >> "$GITHUB_OUTPUT"
+          echo "cli_version=$cli_version" >> "$GITHUB_OUTPUT"
+          echo "MAAComponent 版本: $maa_version / maa-cli 版本: $cli_version"
+
+  # 静态检查：脚本与 workflow 自身（快速失败，避免白跑构建）
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install shellcheck
+        run: |
+          shellcheck --version || { sudo apt-get update -qq && sudo apt-get install -y shellcheck; }
+
+      - name: Shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -s bash android/maa-android-connect.sh
+
+      - name: Actionlint
+        run: |
+          bash <(curl -sSf https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  # 交叉编译 maa-cli 到 Android
+  build-cli:
+    name: Build maa-cli (${{ matrix.abi }})
+    needs: [meta, lint]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64
+            target: aarch64-linux-android
+            clang: aarch64-linux-android24-clang
+          - abi: x64
+            target: x86_64-linux-android
+            clang: x86_64-linux-android24-clang
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          add-to-path: false
+
+      - name: Configure cross compiler
+        env:
+          NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          tool="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          sysroot="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          upper="$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')"
+          under="$(echo "${{ matrix.target }}" | tr '-' '_')"
+
+          # 用 clang 本体做 linker，显式给出 --target/--sysroot
+          {
+            echo "CARGO_TARGET_${upper}_LINKER=$tool/clang"
+            echo "CARGO_TARGET_${upper}_RUSTFLAGS=-Clink-arg=--target=${{ matrix.target }}24 -Clink-arg=--sysroot=$sysroot"
+            echo "CC_${under}=$tool/${{ matrix.clang }}"
+            echo "AR_${under}=$tool/llvm-ar"
+            echo "RANLIB_${under}=$tool/llvm-ranlib"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ matrix.abi }}
+
+      - name: Build
+        env:
+          MAA_VERSION: ${{ needs.meta.outputs.cli_version }}
+        run: |
+          set -euo pipefail
+          # 去掉 git2：其 openssl 依赖在 Android 上无法编译（见文件头说明）
+          cargo build --release --locked \
+            --target ${{ matrix.target }} \
+            --package maa-cli \
+            --no-default-features --features core_installer
+
+          binary="target/${{ matrix.target }}/release/maa"
+          test -f "$binary"
+
+          # 冒烟测试：交叉编译产物无法在本机执行，故只做静态校验
+          file "$binary"
+          file "$binary" | grep -qE "$( [ '${{ matrix.abi }}' = 'arm64' ] && echo aarch64 || echo 'x86-64' )"
+
+          # 校验版本号已正确嵌入：maa-cli 通过 build.rs 读取 MAA_VERSION 环境变量
+          # 写入二进制（crates/maa-cli/build.rs），若未设置则回退到 CARGO_PKG_VERSION。
+          # 这里确保 CI 传的版本真的进了产物，避免发布出无版本号/占位版本的包。
+          #
+          # 注意用 grep -a 而非 strings：版本串与相邻字符串紧挨着（无 null 分隔），
+          # strings 不会单独提取它，实测会误报。
+          if ! grep -aqF "$MAA_VERSION" "$binary"; then
+            echo "::error::二进制中未找到版本号 $MAA_VERSION，MAA_VERSION 可能未生效"
+            exit 1
+          fi
+          echo "版本号 $MAA_VERSION 已嵌入产物"
+
+          # 打成 tar（保持上游命名规则：maa_cli-v{version}-{triplet}.tar）
+          tar -cf "${{ matrix.target }}.tar" -C "$(dirname "$binary")" maa
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: maa_cli-${{ matrix.target }}
+          path: ${{ matrix.target }}.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  # 下载官方 MaaCore 组件包，与 maa-cli 组装成完整运行时
+  package:
+    name: Package (${{ matrix.abi }})
+    needs: [meta, build-cli]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64
+            target: aarch64-linux-android
+          - abi: x64
+            target: x86_64-linux-android
+    steps:
+      # 需要仓库里的 android/maa-android-connect.sh（随包分发的辅助脚本）
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: android
+          sparse-checkout-cone-mode: false
+
+      - name: Download maa-cli artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: maa_cli-${{ matrix.target }}
+          path: cli
+
+      - name: Download MaaCore component
+        env:
+          MAA_VERSION: ${{ needs.meta.outputs.maa_version }}
+          ABI: ${{ matrix.abi }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 用 gh（GitHub 官方 CLI，runner 自带）而非第三方 action，
+          # 避免其参数名变更或行为差异。
+          mkdir -p core
+          gh release download "$MAA_VERSION" \
+            --repo MaaAssistantArknights/MaaAssistantArknights \
+            --pattern "MAAComponent-${MAA_VERSION}-android-${ABI}.tar.gz" \
+            --dir core \
+            --clobber
+          ls -lh core/
+          tar xzf "core/MAAComponent-${MAA_VERSION}-android-${ABI}.tar.gz" -C core
+          # 官方包解压后含 ./resource ./lib*.so ./AsstCaller.h 等
+          test -d core/resource
+          test -f core/libMaaCore.so
+
+      # Android 的 OCR 走 OcrPackNcnn（ncnn 后端），而官方 resource（含
+      # MAAComponent 包）只带 onnx 模型 —— ncnn 权重是 Android 专用、约 50MB，
+      # 官方不在共享 resource 里分发，必须在构建期从 onnx 转换而来。
+      # 这里直接复用 MAA-Meow 的转换脚本：它已在生产环境验证过转换参数
+      # （rec: pnnx inputshape=[1,3,48,320]；det: [1,3,640,640] 且必须 fp32）。
+      - name: Checkout MAA-Meow conversion script
+        uses: actions/checkout@v7
+        with:
+          repository: Aliothmoon/MAA-Meow
+          ref: v0.22.0
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: false
+          path: meow
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pnnx
+        run: |
+          set -euo pipefail
+          pip install -r meow/scripts/requirements.txt
+          pnnx --version || true
+
+      - name: Convert OCR models to ncnn
+        run: |
+          set -euo pipefail
+          python meow/scripts/convert_ocr_ncnn.py --resource core/resource
+
+          echo "=== 转换产物 ==="
+          find core/resource -name '*.ncnn.param' | sort
+          echo "=== 自检 ==="
+          # 必须同时具备 det 与 rec 两套 ncnn 权重，否则 Android 上 OCR 会加载失败
+          test -n "$(find core/resource -name 'det.ncnn.param' | head -1)"
+          test -n "$(find core/resource -name 'rec.ncnn.param' | head -1)"
+          echo "det / rec 权重均已生成"
+
+      # patchelf 用于给产物设置 RPATH（见 Assemble 步骤里的说明）
+      - name: Install patchelf
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq patchelf
+          patchelf --version
+
+      - name: Assemble package
+        env:
+          VERSION: ${{ needs.meta.outputs.cli_version }}
+          MAA_VERSION: ${{ needs.meta.outputs.maa_version }}
+        run: |
+          set -euo pipefail
+
+          # ── 目录结构 ─────────────────────────────────────────────
+          # 依 maa-cli 的查找逻辑（crates/maa-dirs/src/lib.rs）：
+          #   find_library: 先看 <exe_dir>/libMaaCore.so，再看 <exe_dir>/../lib/
+          #   find_resource: 先看 <exe_dir>/resource，再看 <exe_dir>/../share/maa/resource
+          # 故采用 bin/ + lib/ + share/maa/resource/ 布局，与其他平台的包一致。
+          mkdir -p stage/bin stage/lib stage/share/maa
+
+          # maa-cli 可执行文件
+          tar -xf "cli/${{ matrix.target }}.tar" -C stage/bin
+          test -f stage/bin/maa
+          chmod +x stage/bin/maa
+
+          # 连接辅助脚本（Termux 里一键连本机 adb）
+          cp android/maa-android-connect.sh stage/
+          chmod +x stage/maa-android-connect.sh
+          bash -n stage/maa-android-connect.sh
+
+          # ── MaaCore 组件 ─────────────────────────────────────────
+          echo "=== 官方组件包内容 ==="
+          find core -type f -name '*.so*' | sort
+
+          # 复制 MaaCore 及其依赖库
+          # 排除清单（Termux 用不上，见 README 说明）：
+          #   libMaaAndroidNativeControlUnit.so —— Android 原生控制单元，靠
+          #     MediaProjection + AccessibilityService + JNI 回调工作，需要
+          #     Android App 运行时；Termux 是纯 Linux 进程，无此环境，
+          #     只能改用 adb。该库是给 MAA-Meow 那类 APK 项目用的。
+          #   libfastdeploy_ppocr.so —— 桌面版 OCR 后端；Android 走 OcrPackNcnn
+          #     （用 ncnn 权重），已实测 MaaCore 的 NEEDED 与本库字符串表中都
+          #     不含 fastdeploy，属死重量（约 17MB）。
+          for so in $(find core -type f -name '*.so*' \
+                      ! -name 'libMaaAndroidNativeControlUnit.so' \
+                      ! -name 'libfastdeploy_ppocr.so'); do
+            cp "$so" stage/lib/
+          done
+
+          # 资源（官方包内已含完整 resource，无需另行下载）
+          if [ -d core/resource ]; then
+            cp -r core/resource stage/share/maa/
+            echo "resource 条目数: $(find stage/share/maa/resource -type f | wc -l)"
+          else
+            echo "::error::官方组件包内未找到 resource 目录"
+            exit 1
+          fi
+
+          # ── 自检 ────────────────────────────────────────────────
+          test -f stage/lib/libMaaCore.so
+          test -f stage/share/maa/resource/version.json
+
+          # ── 设置 RPATH ──────────────────────────────────────────
+          # 实测发现（Android 12 + Termux）：不设 RPATH 时，MaaCore 找不到同目录的
+          # 依赖库（libMaaUtils.so 等），只能靠 LD_LIBRARY_PATH 补；
+          # 而 LD_LIBRARY_PATH 会被子进程继承 —— MaaCore 调用 adb 时，
+          # adb 也带上了本目录，于是优先加载了本目录的 libc++_shared.so
+          # （NDK 版），与 Termux 环境不兼容，报：
+          #   CANNOT LINK EXECUTABLE "adb": cannot locate symbol
+          #   "_ZNSt6__ndk113__hash_memoryEPKvm"
+          # 表现为 adb 启动失败 → MaaCore 报 connect failed。
+          #
+          # 给库设 $ORIGIN 后一切自解析，用户无需设置 LD_LIBRARY_PATH，
+          # 也就不可能污染 adb 等子进程。
+          for so in stage/lib/*.so; do
+            patchelf --set-rpath '$ORIGIN' "$so"
+          done
+          # bin/maa 需要找到 ../lib 下的 MaaCore
+          patchelf --set-rpath '$ORIGIN/../lib' stage/bin/maa
+
+          # 验证 RPATH 确实写入了（patchelf 静默成功不代表生效）
+          echo "=== RPATH 校验 ==="
+          patchelf --print-rpath stage/lib/libMaaCore.so
+          patchelf --print-rpath stage/bin/maa
+          case "$(patchelf --print-rpath stage/lib/libMaaCore.so)" in
+            *'$ORIGIN'*) echo "lib 的 RPATH 正确" ;;
+            *) echo "::error::libMaaCore.so 的 RPATH 未设置成功"; exit 1 ;;
+          esac
+          case "$(patchelf --print-rpath stage/bin/maa)" in
+            *'$ORIGIN/../lib'*) echo "maa 的 RPATH 正确" ;;
+            *) echo "::error::bin/maa 的 RPATH 未设置成功"; exit 1 ;;
+          esac
+
+          cat > stage/README.md <<EOF
+          # maa-cli for Android·Termux
+
+          由 maa-cli 仓库的 Build Android workflow 构建。
+
+          - maa-cli: v${VERSION}
+          - MaaCore: ${MAA_VERSION}
+            （取自官方 MAAComponent-${MAA_VERSION}-android-${{ matrix.abi }}.tar.gz）
+          - 资源：已随包附带（官方组件包内含）
+
+          包内结构：
+
+          \`\`\`
+          bin/maa                      maa-cli 可执行文件
+          lib/libMaaCore.so            MaaCore
+          lib/libMaaUtils.so           依赖
+          lib/libopencv_world4.so      依赖
+          lib/libonnxruntime.so        依赖
+          lib/libc++_shared.so         C++ 运行时
+          share/maa/resource/          游戏资源
+          \`\`\`
+
+          ## 安装
+
+          \`\`\`bash
+          # 1. 依赖：adb（MaaCore 用它连游戏）
+          pkg install -y android-tools
+
+          # 2. 解包到 maa-cli 的标准位置
+          mkdir -p ~/.local/share/maa ~/.local/bin
+          cp -r bin/maa ~/.local/bin/ && chmod +x ~/.local/bin/maa
+          cp lib/*.so ~/.local/share/maa/lib/ 2>/dev/null || {
+            mkdir -p ~/.local/share/maa/lib && cp lib/*.so ~/.local/share/maa/lib/
+          }
+          cp -r share/maa/resource ~/.local/share/maa/
+
+          # 3. 验证
+          maa version
+          \`\`\`
+
+          > 不需要设置 \`LD_LIBRARY_PATH\`：包内所有库都已设好
+          > \`RPATH=$ORIGIN\`（\`bin/maa\` 为 \`$ORIGIN/../lib\`），
+          > maa-cli 能自行找到同目录的 MaaCore 及其依赖。
+          >
+          > 请**不要**用 \`LD_LIBRARY_PATH\` 指到本包的 lib 目录：
+          > 该变量会传给子进程，导致 MaaCore 调用的 \`adb\` 误加载本包的
+          > \`libc++_shared.so\`（NDK 版），报
+          > \`CANNOT LINK EXECUTABLE "adb": cannot locate symbol\`，
+          > 最终表现为连接失败。
+
+          若 \`~/.local/bin\` 不在 PATH：
+
+          \`\`\`bash
+          echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.bashrc && . ~/.bashrc
+          \`\`\`
+
+          ## 连接游戏（必须走 adb）
+
+          ⚠️ Termux 里**无法使用** Android 原生控制，只能通过 adb。
+          原因：原生控制要求 MaaCore 通过 \`libbridge.so\` 提供截图与输入注入，
+          而官方那份 \`libbridge.so\` 是 Android App 的 JNI 桥，依赖
+          MediaProjection（虚拟显示）+ AccessibilityService，需要 Android App
+          运行时；Termux 是纯 Linux 进程，没有这些能力。
+          （这也是包内不含 \`libMaaAndroidNativeControlUnit.so\` 的原因——
+          那是给 MAA-Meow 这类 APK 项目用的。）
+
+          ### 用附带脚本自动连接（推荐）
+
+          \`\`\`bash
+          ./maa-android-connect.sh
+          \`\`\`
+
+          脚本按成功率依次尝试三种方式：
+
+          1. **mDNS 发现**（无需 root，要求此前配对过无线调试）
+          2. **root 设固定端口**（有 su 时最省事）：
+             \`setprop service.adb.tcp.port 5555\` + 重启 adbd，然后连 127.0.0.1:5555
+          3. **扫描常见端口**
+
+          全部失败时会打印手动步骤。也可指定单一方式：
+
+          \`\`\`bash
+          ./maa-android-connect.sh --root      # 只试 root 方式
+          ./maa-android-connect.sh --mdns      # 只试 mDNS
+          ./maa-android-connect.sh --verbose   # 看详细过程
+          \`\`\`
+
+          ### 手动连接
+
+          \`\`\`bash
+          # 无 root：用系统「无线调试」（需配对码）
+          adb pair 127.0.0.1:<配对端口>
+          adb connect 127.0.0.1:<调试端口>
+
+          # 有 root：直接设固定端口，免配对
+          su -c 'setprop service.adb.tcp.port 5555; setprop ctl.restart adbd'
+          adb connect 127.0.0.1:5555
+          \`\`\`
+
+          连上后即可使用：
+
+          \`\`\`bash
+          maa startup                        # 开始唤醒
+          maa fight 1-7 --times 5            # 刷理智
+          \`\`\`
+
+          > MAA 只支持 16:9 分辨率。识别异常时先 \`wm size\` 查看，
+          > 必要时 \`wm size 1080x1920\` 调整（部分设备需 root）。
+
+          ## 已知限制
+
+          - **必须用 adb**：如上，无法用原生控制，稳定性与性能受 adb 回环影响。
+          - **无 git2 资源后端**：maa-cli 以 \`--no-default-features --features
+            core_installer\` 构建（git2 的 openssl 依赖无法在 Android 交叉编译）。
+            影响：\`maa update\` 走 HTTP 而非 git 拉取，功能可用。
+          - 若只用官方 MAA-Meow 就够了，可优先考虑它（原生控制、免 adb、带 GUI）。
+          EOF
+
+          # 打成上游风格的 tar.gz
+          archive="maa_cli-v${VERSION}-${{ matrix.target }}.tar.gz"
+          tar czf "$archive" -C stage .
+          echo "=== 产物 ==="
+          ls -lh "$archive"
+          tar tzf "$archive" | head -20
+
+          # 生成校验和
+          sha256sum "$archive" > "$archive.sha256"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-package-${{ matrix.abi }}
+          path: |
+            maa_cli-v*-${{ matrix.target }}.tar.gz
+            maa_cli-v*-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  # 汇总：所有包齐了才提示可发布（发布需手动，避免误触发）
+  summary:
+    name: Summary
+    needs: [meta, package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: android-package-*
+          merge-multiple: true
+
+      - name: Show artifacts
+        run: |
+          echo "## Android 构建产物（maa-cli v${{ needs.meta.outputs.cli_version }}）" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "MaaCore 版本：${{ needs.meta.outputs.maa_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 文件 | 大小 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|------|" >> "$GITHUB_STEP_SUMMARY"
+          for f in *.tar.gz; do
+            printf '| `%s` | %s |\n' "$f" "$(du -h "$f" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "从本次 run 的 Artifacts 下载。" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh

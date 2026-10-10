@@ -7,7 +7,7 @@ maa-android-connect —— 在 Termux 里把 MAA 自动连到本机 adb
 
 按成功率从高到低依次尝试 mDNS 发现、root 设固定端口、扫描常见端口。
 连接原理与手动步骤见：
-https://github.com/MaaAssistantArknights/maa-cli/blob/main/crates/maa-cli/docs/zh-CN/install.md#android-termux
+https://docs.maa.plus/zh-cn/manual/cli/install.html#android-termux
 
 用法：
   ./maa-android-connect.sh            # 自动尝试所有方式
@@ -162,5 +162,5 @@ fi
 
 echo
 err "自动连接失败，手动连接步骤见："
-err "  https://github.com/MaaAssistantArknights/maa-cli/blob/main/crates/maa-cli/docs/zh-CN/install.md#android-termux"
+err "  https://docs.maa.plus/zh-cn/manual/cli/install.html#android-termux"
 exit 1

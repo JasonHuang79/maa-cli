@@ -87,10 +87,6 @@ impl Middleware for GitHubProxyMiddleware {
 }
 
 pub static AGENT: LazyLock<Agent> = LazyLock::new(|| {
-    // Android 上 rustls-platform-verifier 需要 Android Context（经 JNI）才能初始化，
-    // 而 Termux / 纯命令行环境拿不到它，会在发起 HTTPS 请求时 panic
-    // （"Expect rustls-platform-verifier to be initialized"）。
-    // 故改用内置的 Mozilla 根证书；其他平台仍用系统证书库，以支持企业内网的自签证书。
     #[cfg(target_os = "android")]
     let root_certs = RootCerts::WebPki;
     #[cfg(not(target_os = "android"))]

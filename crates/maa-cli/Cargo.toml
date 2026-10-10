@@ -43,10 +43,6 @@ toml = { workspace = true }
 [target.'cfg(not(target_os = "android"))'.dependencies]
 ureq = { workspace = true, features = ["json", "platform-verifier"] }
 
-# Android 上 rustls-platform-verifier 需要 Android Context（经 JNI）才能初始化，
-# 而 Termux / 纯命令行环境拿不到它，会在发起 HTTPS 请求时 panic
-# （"Expect rustls-platform-verifier to be initialized"）。
-# 故改用内置的 Mozilla 根证书，不依赖系统证书库。
 [target.'cfg(target_os = "android")'.dependencies]
 ureq = { workspace = true, features = ["json", "rustls-webpki-roots"] }
 

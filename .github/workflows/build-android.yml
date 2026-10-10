@@ -313,9 +313,6 @@ jobs:
             *) echo "::error::bin/maa 的 RPATH 未设置成功"; exit 1 ;;
           esac
 
-          cp android/README.md stage/README.md
-          test -s stage/README.md
-
           archive="maa_cli-v${VERSION}-${{ matrix.target }}.tar.gz"
           tar czf "$archive" -C stage .
           echo "=== 产物 ==="

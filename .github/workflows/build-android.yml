@@ -302,7 +302,10 @@ jobs:
           tar czf "$archive" -C stage .
           echo "=== 产物 ==="
           ls -lh "$archive"
-          tar tzf "$archive" | head -20
+          # 先落盘再 head：直接 `tar tzf | head` 会因 head 提前退出让 tar 收到 SIGPIPE，
+          # 在 pipefail 下表现为写 stdout 失败
+          tar tzf "$archive" > /tmp/archive-list.txt
+          head -20 /tmp/archive-list.txt
 
           sha256sum "$archive" > "$archive.sha256"
 
@@ -335,7 +338,7 @@ jobs:
             echo ""
             echo "| 文件 | 大小 |"
             echo "|------|------|"
-            for f in *.tar.gz; do
+            for f in ./*.tar.gz; do
               printf '| %s | %s |\n' "$f" "$(du -h "$f" | cut -f1)"
             done
             echo ""

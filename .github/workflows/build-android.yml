@@ -14,6 +14,9 @@ on:
         default: ""
   schedule:
     - cron: "0 4 * * 1"
+  push:
+    branches:
+      - feat/android-core-runtime-install
 
 defaults:
   run:
